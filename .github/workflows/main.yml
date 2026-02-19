@@ -26,7 +26,7 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_EMAIL:        ${{ secrets.ALERT_EMAIL }}
           FRED_API_KEY:       ${{ secrets.FRED_API_KEY }}
-        run: python signal_monitor.py --force
+        run: python signal_monitor.py 
 
       - name: Commit state
         run: |
