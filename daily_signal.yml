@@ -1,0 +1,43 @@
+name: SMH Signal Monitor
+
+on:
+  schedule:
+    # Run at 10pm UTC (6pm ET / 5pm CT) — after market close + data settle
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:  # Manual trigger button in GitHub UI
+
+permissions:
+  contents: write  # needed to commit state.json updates
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run signal monitor
+        env:
+          GMAIL_ADDRESS:      ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_EMAIL:        ${{ secrets.ALERT_EMAIL }}
+          FRED_API_KEY:       ${{ secrets.FRED_API_KEY }}
+          # Optional SMS (leave blank to skip):
+          TWILIO_SID:   ${{ secrets.TWILIO_SID }}
+          TWILIO_TOKEN: ${{ secrets.TWILIO_TOKEN }}
+          TWILIO_FROM:  ${{ secrets.TWILIO_FROM }}
+          TWILIO_TO:    ${{ secrets.TWILIO_TO }}
+        run: python signal_monitor.py
+
+      - name: Commit state if changed
+        run: |
+          git config user.name "Signal Bot"
+          git config user.email "bot@smh-signal.local"
+          git add state.json
+          git diff --cached --quiet || git commit -m "signal update: $(date -u +%Y-%m-%d)"
+          git push || true
