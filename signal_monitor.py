@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-SMH Asymmetric Signal Monitor
-Locked params: BB(12,σ1.5) Trig:0.5 Mom(ROC25) Flip:3% Def:90% Agg:170% Stop:4×ATR PPI:1
-Runs daily via GitHub Actions. Emails on regime change.
+SMH + SOXL Signal Monitor
+─────────────────────────
+SMH Asymmetric: BB(12,σ1.5) Trig:0.5 Mom(ROC25) Flip:3% Def:90% Agg:170% Stop:4×ATR PPI:1
+SOXL Sniper:    BB(15,σ1.5) Trig:0.5 Mom(ROC15) Flip:2% Tier:cons(25/50/80) Prof:20% ExZ:0 Cool:5d
+
+Runs daily via GitHub Actions. Emails on regime change for either strategy.
 """
 
 import json, os, sys, smtplib, math
@@ -11,23 +14,43 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# ── Locked Parameters ──────────────────────────────────
-BB_P    = 12
-BB_SD   = 1.5
-BB_TRIG = 0.5
-MOM_P   = 25
-MOM_FLIP= 3.0
-DEF_PCT = 90
-AGG_PCT = 170
-STOP_X  = 4
-PPI_WT  = 1.0
+# ═══════════════════════════════════════════════════════
+# LOCKED PARAMETERS
+# ═══════════════════════════════════════════════════════
+
+# SMH Asymmetric
+SMH_BB_P     = 12
+SMH_BB_SD    = 1.5
+SMH_BB_TRIG  = 0.5
+SMH_MOM_P    = 25
+SMH_MOM_FLIP = 3.0
+SMH_DEF_PCT  = 90
+SMH_AGG_PCT  = 170
+SMH_STOP_X   = 4
+SMH_PPI_WT   = 1.0
+
+# SOXL Sniper
+SOX_BB_P     = 15
+SOX_BB_SD    = 1.5
+SOX_BB_TRIG  = 0.5
+SOX_MOM_P    = 15
+SOX_MOM_FLIP = 2.0
+SOX_T1_PCT   = 25
+SOX_T2_PCT   = 50
+SOX_T3_PCT   = 80
+SOX_T2_MULT  = 1.5
+SOX_T3_MULT  = 2.0
+SOX_PROFIT   = 20.0
+SOX_EXIT_Z   = 0.0
+SOX_COOL     = 5
 
 STATE_FILE = Path(__file__).parent / "state.json"
 
-# ── Data Fetching ──────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+# DATA FETCHING
+# ═══════════════════════════════════════════════════════
 def fetch_yahoo(symbol, days=120):
-    """Fetch daily OHLC from Yahoo Finance v8 (no API key needed)."""
-    import urllib.request, urllib.error
+    import urllib.request
     end = int(datetime.now().timestamp())
     start = int((datetime.now() - timedelta(days=days)).timestamp())
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?period1={start}&period2={end}&interval=1d"
@@ -59,7 +82,6 @@ def fetch_yahoo(symbol, days=120):
     return rows
 
 def fetch_fred_ppi(api_key):
-    """Fetch PCU33443344 (Semi PPI) from FRED."""
     import urllib.request
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=PCU33443344&sort_order=desc&limit=24&api_key={api_key}&file_type=json"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -79,8 +101,10 @@ def fetch_fred_ppi(api_key):
     rows.sort(key=lambda r: r["date"])
     return rows
 
-# ── Indicators ─────────────────────────────────────────
-def sma(arr, p):
+# ═══════════════════════════════════════════════════════
+# INDICATORS
+# ═══════════════════════════════════════════════════════
+def ind_sma(arr, p):
     r = [None]*len(arr)
     for i in range(p-1, len(arr)):
         vals = arr[i-p+1:i+1]
@@ -88,8 +112,8 @@ def sma(arr, p):
         r[i] = sum(vals)/p
     return r
 
-def stdev(arr, p):
-    m = sma(arr, p)
+def ind_stdev(arr, p):
+    m = ind_sma(arr, p)
     r = [None]*len(arr)
     for i in range(p-1, len(arr)):
         if m[i] is None: continue
@@ -98,7 +122,7 @@ def stdev(arr, p):
         r[i] = math.sqrt(sum((v - m[i])**2 for v in vals) / p)
     return r
 
-def atr(highs, lows, closes, p):
+def ind_atr(highs, lows, closes, p):
     tr = [None]*len(closes)
     for i in range(len(closes)):
         if i == 0:
@@ -106,53 +130,50 @@ def atr(highs, lows, closes, p):
             continue
         if highs[i] is None or lows[i] is None or closes[i-1] is None: continue
         tr[i] = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
-    return sma(tr, p)
+    return ind_sma(tr, p)
 
-def roc(arr, p):
+def ind_roc(arr, p):
     r = [None]*len(arr)
     for i in range(p, len(arr)):
         if arr[i] is None or arr[i-p] is None or arr[i-p] == 0: continue
         r[i] = ((arr[i] - arr[i-p]) / arr[i-p]) * 100
     return r
 
-# ── Signal Computation ─────────────────────────────────
-def compute_signal(smh_rows, qqq_rows=None, ppi_rows=None):
-    """Compute current regime signal from market data."""
-    # Build aligned series
-    if qqq_rows:
-        qqq_map = {r["date"]: r["close"] for r in qqq_rows}
+# ═══════════════════════════════════════════════════════
+# SMH SIGNAL
+# ═══════════════════════════════════════════════════════
+def compute_smh_signal(smh, qqq=None, ppi=None):
+    hasQQQ = qqq and len(qqq) > 0
+    if hasQQQ:
+        qqq_map = {r["date"]: r["close"] for r in qqq}
         data = []
-        for r in smh_rows:
+        for r in smh:
             qc = qqq_map.get(r["date"])
             if qc and qc > 0:
-                data.append({**r, "qqq": qc, "ratio": r["close"]/qc})
+                data.append({**r, "ratio": r["close"]/qc})
     else:
-        data = [{**r, "qqq": None, "ratio": None} for r in smh_rows]
-
-    if len(data) < 50:
-        return None, "Not enough data"
+        data = [{**r, "ratio": None} for r in smh]
+    if len(data) < 50: return None, "Not enough data"
 
     closes = [d["close"] for d in data]
-    highs  = [d["high"] for d in data]
-    lows   = [d["low"] for d in data]
-    bb_series = [d["ratio"] for d in data] if qqq_rows else closes
+    highs = [d["high"] for d in data]
+    lows = [d["low"] for d in data]
+    bb_series = [d["ratio"] for d in data] if hasQQQ else closes
 
-    bb_m  = sma(bb_series, BB_P)
-    bb_sd = stdev(bb_series, BB_P)
-    atr14 = atr(highs, lows, closes, 14)
-    mom   = roc(closes, MOM_P)
+    bb_m = ind_sma(bb_series, SMH_BB_P)
+    bb_sd = ind_stdev(bb_series, SMH_BB_P)
+    atr14 = ind_atr(highs, lows, closes, 14)
+    mom = ind_roc(closes, SMH_MOM_P)
 
-    # PPI momentum (3-month change)
     ppi_tilt = 0.0
-    if ppi_rows and len(ppi_rows) >= 4:
-        sorted_ppi = sorted(ppi_rows, key=lambda r: r["date"])
+    if ppi and len(ppi) >= 4:
+        sorted_ppi = sorted(ppi, key=lambda r: r["date"])
         latest = sorted_ppi[-1]["close"]
-        three_mo_ago = sorted_ppi[-4]["close"] if len(sorted_ppi) >= 4 else sorted_ppi[0]["close"]
-        if three_mo_ago > 0:
-            ppi_mom = ((latest - three_mo_ago) / three_mo_ago) * 100
+        three_mo = sorted_ppi[-4]["close"] if len(sorted_ppi) >= 4 else sorted_ppi[0]["close"]
+        if three_mo > 0:
+            ppi_mom = ((latest - three_mo) / three_mo) * 100
             ppi_tilt = max(-1.0, min(1.0, ppi_mom / 3.0))
 
-    # ATR percentiles for adaptive bands
     atr_vals = sorted([v for v in atr14 if v is not None])
     p75 = atr_vals[int(len(atr_vals)*0.75)] if atr_vals else 999
     p25 = atr_vals[int(len(atr_vals)*0.25)] if atr_vals else 0
@@ -162,111 +183,242 @@ def compute_signal(smh_rows, qqq_rows=None, ppi_rows=None):
         return None, "Indicators not ready"
 
     ca = atr14[idx]
-    esd = BB_SD
-    if ca > p75: esd = BB_SD + 0.5
-    elif ca < p25: esd = max(1.0, BB_SD - 0.5)
+    esd = SMH_BB_SD
+    if ca > p75: esd = SMH_BB_SD + 0.5
+    elif ca < p25: esd = max(1.0, SMH_BB_SD - 0.5)
 
-    upper = bb_m[idx] + esd * bb_sd[idx]
-    lower = bb_m[idx] - esd * bb_sd[idx]
-    rng = upper - lower
+    rng = 2 * esd * bb_sd[idx] if bb_sd[idx] > 0 else 1
     bb_z = (bb_series[idx] - bb_m[idx]) / (rng/2) if rng > 0 else 0
     mom_v = mom[idx]
 
-    agg_trig = -(BB_TRIG - ppi_tilt * PPI_WT * 0.3)
-    def_trig = BB_TRIG + ppi_tilt * PPI_WT * 0.3
+    agg_trig = -(SMH_BB_TRIG - ppi_tilt * SMH_PPI_WT * 0.3)
+    def_trig = SMH_BB_TRIG + ppi_tilt * SMH_PPI_WT * 0.3
 
-    if bb_z < agg_trig and mom_v > MOM_FLIP:
-        regime, target = "AGG", AGG_PCT
-    elif bb_z > def_trig and mom_v < -MOM_FLIP:
-        regime, target = "DEF", DEF_PCT
+    if bb_z < agg_trig and mom_v > SMH_MOM_FLIP:
+        regime, target = "AGG", SMH_AGG_PCT
+    elif bb_z > def_trig and mom_v < -SMH_MOM_FLIP:
+        regime, target = "DEF", SMH_DEF_PCT
     else:
         regime, target = "HOLD", 100
 
     stop_level = None
-    if regime == "AGG" and STOP_X > 0:
-        stop_level = round(closes[idx] - STOP_X * ca, 2)
+    if regime == "AGG" and SMH_STOP_X > 0:
+        stop_level = round(closes[idx] - SMH_STOP_X * ca, 2)
 
     return {
-        "regime": regime,
-        "target": target,
-        "price": round(closes[idx], 2),
-        "date": data[idx]["date"],
-        "bb_z": round(bb_z, 3),
-        "mom": round(mom_v, 2),
-        "ppi_tilt": round(ppi_tilt, 2),
-        "agg_trig": round(agg_trig, 2),
-        "def_trig": round(def_trig, 2),
-        "atr": round(ca, 2),
-        "stop_level": stop_level,
+        "regime": regime, "target": target, "price": round(closes[idx], 2),
+        "date": data[idx]["date"], "bb_z": round(bb_z, 3), "mom": round(mom_v, 2),
+        "ppi_tilt": round(ppi_tilt, 2), "agg_trig": round(agg_trig, 2),
+        "def_trig": round(def_trig, 2), "atr": round(ca, 2), "stop_level": stop_level,
     }, None
 
-# ── State Management ───────────────────────────────────
+# ═══════════════════════════════════════════════════════
+# SOXL SIGNAL
+# ═══════════════════════════════════════════════════════
+def compute_soxl_signal(smh, soxl, qqq=None, prev_state=None):
+    hasQQQ = qqq and len(qqq) > 0
+    soxl_map = {r["date"]: r for r in soxl}
+    if hasQQQ:
+        qqq_map = {r["date"]: r["close"] for r in qqq}
+        data = []
+        for r in smh:
+            sx = soxl_map.get(r["date"])
+            qc = qqq_map.get(r["date"])
+            if sx and qc and qc > 0:
+                data.append({**r, "soxl": sx["close"], "ratio": r["close"]/qc})
+    else:
+        data = []
+        for r in smh:
+            sx = soxl_map.get(r["date"])
+            if sx:
+                data.append({**r, "soxl": sx["close"], "ratio": None})
+    if len(data) < 50: return None, "Not enough SOXL data"
+
+    closes = [d["close"] for d in data]
+    highs = [d["high"] for d in data]
+    lows = [d["low"] for d in data]
+    bb_series = [d["ratio"] for d in data] if hasQQQ else closes
+
+    bb_m = ind_sma(bb_series, SOX_BB_P)
+    bb_sd = ind_stdev(bb_series, SOX_BB_P)
+    atr14 = ind_atr(highs, lows, closes, 14)
+    mom = ind_roc(closes, SOX_MOM_P)
+
+    atr_vals = sorted([v for v in atr14 if v is not None])
+    p75 = atr_vals[int(len(atr_vals)*0.75)] if atr_vals else 999
+    p25 = atr_vals[int(len(atr_vals)*0.25)] if atr_vals else 0
+
+    idx = len(data) - 1
+    if bb_m[idx] is None or bb_sd[idx] is None or atr14[idx] is None or mom[idx] is None:
+        return None, "SOXL indicators not ready"
+
+    ca = atr14[idx]
+    esd = SOX_BB_SD
+    if ca > p75: esd = SOX_BB_SD + 0.5
+    elif ca < p25: esd = max(1.0, SOX_BB_SD - 0.5)
+
+    rng = 2 * esd * bb_sd[idx] if bb_sd[idx] > 0 else 1
+    bb_z = (bb_series[idx] - bb_m[idx]) / (rng/2) if rng > 0 else 0
+    mom_v = mom[idx]
+    agg_trig = -SOX_BB_TRIG
+
+    # Determine tier depth
+    tier = None
+    if bb_z < agg_trig * SOX_T3_MULT:
+        tier = "T3"
+    elif bb_z < agg_trig * SOX_T2_MULT:
+        tier = "T2"
+    elif bb_z < agg_trig:
+        tier = "T1"
+
+    # State machine
+    ps = prev_state or {"state": "CASH", "cooldown": 0, "entry_price": 0}
+    cur_state = ps.get("state", "CASH")
+    cooldown = ps.get("cooldown", 0)
+    entry_price = ps.get("entry_price", 0)
+    soxl_price = data[idx]["soxl"]
+    smh_price = data[idx]["close"]
+
+    action = None
+    new_state = cur_state
+
+    if cur_state in ("T1", "T2", "T3"):
+        pnl = ((soxl_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        if SOX_PROFIT > 0 and pnl >= SOX_PROFIT:
+            action = f"🎯 EXIT — PROFIT TARGET HIT ({pnl:.1f}% >= {SOX_PROFIT}%). Sell all SOXL."
+            new_state = "COOL"
+            cooldown = SOX_COOL
+        elif bb_z > SOX_EXIT_Z:
+            action = f"📊 EXIT — BB NORMALIZED (Z={bb_z:.2f} > {SOX_EXIT_Z}). Sell all SOXL. P&L: {pnl:.1f}%"
+            new_state = "COOL"
+            cooldown = SOX_COOL
+        else:
+            action = f"🔥 HOLD position. P&L: {pnl:.1f}% | Entry: ${entry_price:.2f}"
+            if cur_state == "T1" and tier in ("T2", "T3"):
+                action += f" | TIER UP to {tier} available (Z={bb_z:.2f})"
+            elif cur_state == "T2" and tier == "T3":
+                action += f" | TIER UP to T3 available (Z={bb_z:.2f})"
+    elif cur_state == "COOL":
+        cooldown -= 1
+        if cooldown <= 0:
+            new_state = "CASH"
+            action = "✅ Cooldown complete. Back to CASH."
+        else:
+            action = f"⏳ Cooldown: {cooldown} trading days remaining."
+    else:  # CASH
+        if bb_z < agg_trig and mom_v > SOX_MOM_FLIP:
+            deploy_tier = tier or "T1"
+            pct = {"T1": SOX_T1_PCT, "T2": SOX_T2_PCT, "T3": SOX_T3_PCT}[deploy_tier]
+            action = f"🎯 ENTRY SIGNAL — Deploy {pct}% into SOXL at ${soxl_price:.2f} ({deploy_tier})"
+            new_state = deploy_tier
+            entry_price = soxl_price
+        elif bb_z < agg_trig:
+            action = f"⚠️ BB oversold (Z={bb_z:.2f}) but momentum not confirmed ({mom_v:.1f}% <= {SOX_MOM_FLIP}%). Watch."
+        else:
+            action = "💤 No signal. Stay in cash."
+
+    return {
+        "state": new_state, "prev_state": cur_state, "action": action,
+        "smh_price": round(smh_price, 2), "soxl_price": round(soxl_price, 2),
+        "date": data[idx]["date"], "bb_z": round(bb_z, 3), "mom": round(mom_v, 2),
+        "agg_trig": round(agg_trig, 2), "tier": tier,
+        "cooldown": cooldown, "entry_price": round(entry_price, 2),
+        "changed": new_state != cur_state,
+    }, None
+
+# ═══════════════════════════════════════════════════════
+# STATE PERSISTENCE
+# ═══════════════════════════════════════════════════════
 def load_state():
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text())
-    return {"regime": None, "date": None, "price": None}
+    return {"smh": {"regime": None}, "soxl": {"state": "CASH", "cooldown": 0, "entry_price": 0}}
 
-def save_state(signal):
+def save_state(smh_sig, soxl_sig):
     STATE_FILE.write_text(json.dumps({
-        "regime": signal["regime"],
-        "date": signal["date"],
-        "price": signal["price"],
-        "target": signal["target"],
-        "bb_z": signal["bb_z"],
-        "mom": signal["mom"],
+        "smh": {
+            "regime": smh_sig["regime"], "date": smh_sig["date"],
+            "price": smh_sig["price"], "target": smh_sig["target"],
+        },
+        "soxl": {
+            "state": soxl_sig["state"], "date": soxl_sig["date"],
+            "cooldown": soxl_sig["cooldown"], "entry_price": soxl_sig["entry_price"],
+        },
         "updated": datetime.now().isoformat(),
     }, indent=2))
 
-# ── Email Alert ────────────────────────────────────────
-def send_email(signal, prev_regime):
-    sender   = os.environ.get("GMAIL_ADDRESS", "")
+# ═══════════════════════════════════════════════════════
+# EMAIL
+# ═══════════════════════════════════════════════════════
+def send_email(smh_sig, soxl_sig, smh_changed, soxl_changed, force_daily=False):
+    sender = os.environ.get("GMAIL_ADDRESS", "")
     password = os.environ.get("GMAIL_APP_PASSWORD", "")
-    to_addr  = os.environ.get("ALERT_EMAIL", sender)
-
+    to_addr = os.environ.get("ALERT_EMAIL", sender)
     if not sender or not password:
-        print("WARNING: Gmail credentials not set, skipping email")
+        print("WARNING: Gmail credentials not set")
         return False
 
-    emoji = {"AGG": "🔥", "DEF": "🛡", "HOLD": "📊"}.get(signal["regime"], "⚠️")
-    subject = f"{emoji} SMH Signal: {prev_regime or 'INIT'} → {signal['regime']} ({signal['target']}%)"
+    parts = []
+    if smh_changed:
+        parts.append(f"SMH→{smh_sig['regime']}({smh_sig['target']}%)")
+    if soxl_changed:
+        parts.append(f"SOXL→{soxl_sig['state']}")
 
-    body = f"""SMH Asymmetric Signal Change
-{'='*40}
-
-Regime:  {prev_regime or 'NONE'} → {signal['regime']}
-Target:  {signal['target']}% allocation
-Price:   ${signal['price']}
-Date:    {signal['date']}
-
-Signal Details:
-  BB Z-Score:  {signal['bb_z']}  (Agg trigger: {signal['agg_trig']}, Def trigger: {signal['def_trig']})
-  Momentum:    {signal['mom']}%  (Flip: ±{MOM_FLIP}%)
-  PPI Tilt:    {signal['ppi_tilt']}
-  ATR(14):     ${signal['atr']}
-  Stop Level:  {'$' + str(signal['stop_level']) if signal['stop_level'] else 'N/A (not in AGG)'}
-
-Action Required:
-"""
-    if signal["regime"] == "AGG":
-        body += f"  → INCREASE position to {signal['target']}% of portfolio value\n"
-        body += f"  → Set stop-loss at ${signal['stop_level']}\n"
-    elif signal["regime"] == "DEF":
-        body += f"  → TRIM position to {signal['target']}% of portfolio value\n"
+    if parts:
+        subject = "🚨 " + " | ".join(parts)
+    elif force_daily:
+        subject = f"📊 Daily: SMH {smh_sig['regime']} | SOXL {soxl_sig['state']}"
     else:
-        body += f"  → HOLD at 100% baseline. No action needed.\n"
+        return False
+
+    body = f"""Signal Monitor — {smh_sig['date']}
+{'='*55}
+
+━━━ SMH ASYMMETRIC ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Regime:     {smh_sig['regime']} → {smh_sig['target']}% allocation
+  SMH Price:  ${smh_sig['price']}
+  BB Z-Score: {smh_sig['bb_z']}  (Agg trigger: {smh_sig['agg_trig']}, Def trigger: {smh_sig['def_trig']})
+  Momentum:   {smh_sig['mom']}%  (Flip: ±{SMH_MOM_FLIP}%)
+  PPI Tilt:   {smh_sig['ppi_tilt']}
+  ATR(14):    ${smh_sig['atr']}
+"""
+    if smh_sig["regime"] == "AGG":
+        body += f"""  Stop Loss:  ${smh_sig['stop_level']}
+
+  ▶ ACTION: INCREASE SMH to {smh_sig['target']}% allocation.
+    Stop at ${smh_sig['stop_level']}.
+"""
+    elif smh_sig["regime"] == "DEF":
+        body += f"""
+  ▶ ACTION: TRIM SMH to {smh_sig['target']}% allocation.
+"""
+    else:
+        body += f"""
+  ▶ No action. Hold SMH at 100%.
+"""
 
     body += f"""
-Locked Parameters:
-  BB(12, σ1.5) Trig:0.5 Mom(ROC25) Flip:3%
-  Def:90% Base:100% Agg:170% Stop:4×ATR PPI:1
+━━━ SOXL SNIPER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  State:      {soxl_sig['prev_state']} → {soxl_sig['state']}
+  SMH:        ${soxl_sig['smh_price']}  |  SOXL: ${soxl_sig['soxl_price']}
+  BB Z-Score: {soxl_sig['bb_z']}  (Entry trigger: {soxl_sig['agg_trig']})
+  Momentum:   {soxl_sig['mom']}%  (Flip: ±{SOX_MOM_FLIP}%)
+  Cooldown:   {soxl_sig['cooldown']}d remaining
 
----
-SMH Asymmetric Signal Monitor (automated)
+  ▶ {soxl_sig['action']}
+
+━━━ LOCKED PARAMS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SMH:  BB(12,σ1.5) Trig:0.5 Mom(ROC25) Flip:3%
+        Def:90% Agg:170% Stop:4×ATR PPI:1
+  SOXL: BB(15,σ1.5) Trig:0.5 Mom(ROC15) Flip:2%
+        Tier:cons(25/50/80) Prof:20% ExZ:0 Cool:5d
+───────────────────────────────────────────────────────
+Automated Signal Monitor · github.com/drnick69/SMHTrader
 """
 
     msg = MIMEMultipart()
-    msg["From"]    = sender
-    msg["To"]      = to_addr
+    msg["From"] = sender
+    msg["To"] = to_addr
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
@@ -280,95 +432,68 @@ SMH Asymmetric Signal Monitor (automated)
         print(f"ERROR sending email: {e}")
         return False
 
-# ── SMS Alert (optional Twilio) ────────────────────────
-def send_sms(signal, prev_regime):
-    acct_sid   = os.environ.get("TWILIO_SID", "")
-    auth_token = os.environ.get("TWILIO_TOKEN", "")
-    from_num   = os.environ.get("TWILIO_FROM", "")
-    to_num     = os.environ.get("TWILIO_TO", "")
-
-    if not all([acct_sid, auth_token, from_num, to_num]):
-        return False
-
-    emoji = {"AGG": "🔥", "DEF": "🛡", "HOLD": "📊"}.get(signal["regime"], "⚠️")
-    body = (
-        f"{emoji} SMH: {prev_regime}→{signal['regime']} "
-        f"Target:{signal['target']}% "
-        f"Price:${signal['price']} "
-        f"BBz:{signal['bb_z']} Mom:{signal['mom']}%"
-    )
-    if signal["stop_level"]:
-        body += f" Stop:${signal['stop_level']}"
-
-    import urllib.request, urllib.parse, base64
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{acct_sid}/Messages.json"
-    data = urllib.parse.urlencode({"To": to_num, "From": from_num, "Body": body}).encode()
-    req = urllib.request.Request(url, data=data)
-    cred = base64.b64encode(f"{acct_sid}:{auth_token}".encode()).decode()
-    req.add_header("Authorization", f"Basic {cred}")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            print(f"SMS sent: {resp.status}")
-        return True
-    except Exception as e:
-        print(f"SMS error: {e}")
-        return False
-
-# ── Main ───────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════
 def main():
     fred_key = os.environ.get("FRED_API_KEY", "")
-    force    = "--force" in sys.argv
-    daily    = "--daily" in sys.argv  # send daily status even without change
+    force = "--force" in sys.argv
+    daily = "--daily" in sys.argv
 
-    print(f"[{datetime.now().isoformat()}] SMH Signal Monitor starting...")
+    print(f"[{datetime.now().isoformat()}] Signal Monitor starting...")
+    print(f"  Mode: {'FORCE' if force else 'DAILY' if daily else 'CHANGE-ONLY'}")
 
-    # Fetch data
+    # Fetch all data
     print("Fetching SMH...")
     smh = fetch_yahoo("SMH", days=120)
-    if not smh:
-        print("FATAL: could not fetch SMH"); sys.exit(1)
+    if not smh: print("FATAL: no SMH data"); sys.exit(1)
     print(f"  SMH: {len(smh)} bars, latest {smh[-1]['date']} @ ${smh[-1]['close']:.2f}")
+
+    print("Fetching SOXL...")
+    soxl = fetch_yahoo("SOXL", days=120)
+    if not soxl: print("FATAL: no SOXL data"); sys.exit(1)
+    print(f"  SOXL: {len(soxl)} bars, latest {soxl[-1]['date']} @ ${soxl[-1]['close']:.2f}")
 
     print("Fetching QQQ...")
     qqq = fetch_yahoo("QQQ", days=120)
-    if qqq:
-        print(f"  QQQ: {len(qqq)} bars")
+    if qqq: print(f"  QQQ: {len(qqq)} bars")
 
     ppi = None
     if fred_key:
         print("Fetching Semi PPI...")
         ppi = fetch_fred_ppi(fred_key)
-        if ppi:
-            print(f"  PPI: {len(ppi)} readings, latest {ppi[-1]['date']}: {ppi[-1]['close']}")
-
-    # Compute signal
-    signal, err = compute_signal(smh, qqq, ppi)
-    if err:
-        print(f"ERROR computing signal: {err}"); sys.exit(1)
-
-    print(f"\nSIGNAL: {signal['regime']} → {signal['target']}%")
-    print(f"  Price: ${signal['price']}  BBz: {signal['bb_z']}  Mom: {signal['mom']}%  PPI: {signal['ppi_tilt']}")
-    if signal["stop_level"]:
-        print(f"  Stop: ${signal['stop_level']}")
-
-    # Check for regime change
-    prev = load_state()
-    changed = prev["regime"] != signal["regime"]
-
-    if changed:
-        print(f"\n*** REGIME CHANGE: {prev['regime'] or 'INIT'} → {signal['regime']} ***")
-        send_email(signal, prev.get("regime", "INIT"))
-        send_sms(signal, prev.get("regime", "INIT"))
-    elif daily:
-        print(f"\nNo change (still {signal['regime']}), sending daily status...")
-        send_email(signal, signal["regime"])
-    elif force:
-        print(f"\nForced alert (no change, still {signal['regime']})")
-        send_email(signal, signal["regime"])
+        if ppi: print(f"  PPI: {len(ppi)} readings, latest {ppi[-1]['date']}")
     else:
-        print(f"\nNo change (still {signal['regime']}). No alert sent.")
+        print("  No FRED key — PPI skipped")
 
-    save_state(signal)
+    # Compute signals
+    smh_sig, smh_err = compute_smh_signal(smh, qqq, ppi)
+    if smh_err: print(f"SMH signal error: {smh_err}"); sys.exit(1)
+
+    prev = load_state()
+    soxl_sig, sox_err = compute_soxl_signal(smh, soxl, qqq, prev.get("soxl"))
+    if sox_err: print(f"SOXL signal error: {sox_err}"); sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print(f"  SMH:  {smh_sig['regime']} → {smh_sig['target']}%  |  BBz:{smh_sig['bb_z']}  Mom:{smh_sig['mom']}%")
+    print(f"  SOXL: {soxl_sig['prev_state']} → {soxl_sig['state']}  |  BBz:{soxl_sig['bb_z']}  Mom:{soxl_sig['mom']}%")
+    print(f"  SOXL: {soxl_sig['action']}")
+    print(f"{'='*50}")
+
+    smh_changed = prev.get("smh", {}).get("regime") != smh_sig["regime"]
+    soxl_changed = soxl_sig["changed"]
+
+    if smh_changed: print(f"\n*** SMH REGIME CHANGE: {prev.get('smh',{}).get('regime','?')} → {smh_sig['regime']} ***")
+    if soxl_changed: print(f"*** SOXL STATE CHANGE: {soxl_sig['prev_state']} → {soxl_sig['state']} ***")
+
+    if smh_changed or soxl_changed or force:
+        send_email(smh_sig, soxl_sig, smh_changed or force, soxl_changed or force, False)
+    elif daily:
+        send_email(smh_sig, soxl_sig, False, False, True)
+    else:
+        print("No changes. No email sent.")
+
+    save_state(smh_sig, soxl_sig)
     print("State saved. Done.")
 
 if __name__ == "__main__":
