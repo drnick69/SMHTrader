@@ -1,9 +1,11 @@
 {
-  "regime": "HOLD",
-  "date": "2026-02-19",
-  "price": 410.2,
-  "target": 100,
-  "bb_z": 0.476,
-  "mom": 4.77,
-  "updated": "2026-02-19T23:04:22.429458"
+  "smh": {
+    "regime": null
+  },
+  "soxl": {
+    "state": "CASH",
+    "cooldown": 0,
+    "entry_price": 0
+  },
+  "updated": null
 }
