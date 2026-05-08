@@ -1,15 +1,15 @@
 {
   "smh": {
     "regime": "HOLD",
-    "date": "2026-05-07",
-    "price": 540.1,
+    "date": "2026-05-08",
+    "price": 566.54,
     "target": 100
   },
   "soxl": {
     "state": "CASH",
-    "date": "2026-05-07",
+    "date": "2026-05-08",
     "cooldown": 0,
     "entry_price": 62.77
   },
-  "updated": "2026-05-07T23:01:18.774231"
+  "updated": "2026-05-08T22:56:11.220746"
 }
